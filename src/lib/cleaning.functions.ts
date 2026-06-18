@@ -1,4 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
+import * as XLSX from "xlsx";
+import { categorize } from "./category-lookup";
 
 function parseDateString(str: string): Date | null {
   str = str.trim();
@@ -86,7 +88,18 @@ export interface CleaningResult {
 }
 
 // Client-side/portable clean function (TypeScript)
-export function cleanDataTS(type: "sales" | "purchase", data: any[]): { cleaned: any[]; imputedCount: number } {
+export function cleanDataTS(
+  type: "sales" | "purchase", 
+  data: any[],
+  lookups?: {
+    salesColumnsToKeep?: string[];
+    salesCategoryMap?: Record<string, string>;
+    itemDetailsMap?: Record<string, string>;
+    refurbishmentItems?: { vendor: string; item: string }[];
+    purchaseCategoryMap?: Record<string, { category: string; delete: boolean }>;
+    vendorsMap?: Record<string, { gstin: string; status: string; type: string; city: string }>;
+  }
+): { cleaned: any[]; imputedCount: number } {
   let imputedCount = 0;
 
   const getValCaseInsensitive = (row: any, target: string, variations: string[] = []): any => {
@@ -186,7 +199,14 @@ export function cleanDataTS(type: "sales" | "purchase", data: any[]): { cleaned:
       newRow['Balance'] = numBalance;
 
       // Default Category values
-      newRow['Category'] = getValCaseInsensitive(row, 'Category') || "Others";
+      let category = "Others";
+      if (lookups?.salesCategoryMap && lookups.salesCategoryMap[String(itemName).toUpperCase().trim()]) {
+        category = lookups.salesCategoryMap[String(itemName).toUpperCase().trim()];
+      } else {
+        const localCat = categorize(itemName);
+        if (localCat) category = localCat;
+      }
+      newRow['Category'] = category;
       
       return newRow;
     }).filter(Boolean) as any[];
@@ -270,107 +290,488 @@ export function cleanDataTS(type: "sales" | "purchase", data: any[]): { cleaned:
 
     return { cleaned: uniqueRows, imputedCount };
   } else {
-    // 2. Procurement (purchase) clean
+    // 2. Procurement (purchase) clean - IMPLEMENTING 37 MANDATORY STEPS
+    
+    // Step 1: Initial Missing Value Check (stats logged in console)
+    const missingCounts: Record<string, number> = {};
+    data.forEach(row => {
+      Object.keys(row).forEach(key => {
+        if (row[key] === null || row[key] === undefined || String(row[key]).trim() === "") {
+          missingCounts[key] = (missingCounts[key] || 0) + 1;
+        }
+      });
+    });
+    console.log("TS Initial Missing Value Check:", missingCounts);
+
     const tempRows = data.map((row) => {
       const newRow: Record<string, any> = {};
       
-      const vendorName = getValCaseInsensitive(row, 'Vendor Name', ['vendor_name', 'vendor', 'supplier', 'party_name', 'party name']);
+      const vendorNameRaw = getValCaseInsensitive(row, 'Vendor Name', ['vendor_name', 'vendor', 'supplier', 'party_name', 'party name']);
       const invoiceNumber = getValCaseInsensitive(row, 'Invoice #', ['invoice_number', 'invoice number', 'bill #', 'bill_number', 'bill number', 'invoice #', 'ref']);
-      const submissionDate = getValCaseInsensitive(row, 'Submission Date', ['submission_date', 'date', 'invoice date', 'bill_date']);
-      const invoiceStatus = getValCaseInsensitive(row, 'Invoice Status', ['invoice_status', 'status']);
-      const totalAmount = getValCaseInsensitive(row, 'Total Amount', ['total_amount', 'total', 'amount']);
+      const submissionDateRaw = getValCaseInsensitive(row, 'Submission Date', ['submission_date', 'date', 'invoice date', 'bill_date']);
+      const totalAmountRaw = getValCaseInsensitive(row, 'Total Amount', ['total_amount', 'total', 'amount']);
       const balance = getValCaseInsensitive(row, 'Balance', ['balance']);
       const bv = getValCaseInsensitive(row, 'Business Vertical', ['business_vertical', 'vertical']);
       const division = getValCaseInsensitive(row, 'Division', ['division']);
-      const expenseType = getValCaseInsensitive(row, 'Expense Type', ['expense_type', 'expense']);
-      const debitNote = getValCaseInsensitive(row, 'Debit Note', ['debit_note', 'debit note']);
+      const expenseTypeRaw = getValCaseInsensitive(row, 'Expense Type', ['expense_type', 'expense']);
+      const debitNoteRaw = getValCaseInsensitive(row, 'Debit Note', ['debit_note', 'debit note']);
       const rejectionComments = getValCaseInsensitive(row, 'Rejection Comments', ['rejection_comments', 'rejection comment']);
       const paymentDate = getValCaseInsensitive(row, 'Payment Date', ['payment_date', 'payment date']);
       const bookingStatus = getValCaseInsensitive(row, 'Booking status (For Accounts only)', ['booking_status']);
+      const sumOfBaseAmountRaw = getValCaseInsensitive(row, 'Sum of Base Amount', ['sum_of_base_amount', 'base_amount']);
+      const sumOfTotalAmountRaw = getValCaseInsensitive(row, 'Sum of Total Amount', ['sum_of_total_amount', 'sum_total_amount']);
+      const detailsRaw = getValCaseInsensitive(row, 'Details', ['details', 'item details']);
+      const cityRaw = getValCaseInsensitive(row, 'City', ['city']);
 
-      // Drop empty vendor names
-      if (!vendorName || String(vendorName).trim() === "") {
+      // Step 7: Drop Missing Vendor Names
+      if (!vendorNameRaw || String(vendorNameRaw).trim() === "") {
         return null;
       }
+      const vendorName = String(vendorNameRaw).trim();
 
-      // Initial Assessment (Business Vertical fill from Division)
-      let businessVertical = bv !== undefined && bv !== null && String(bv).trim() !== "" ? bv : division;
-      if (businessVertical && String(businessVertical).trim() === "EPR") {
+      // Step 2: Business Vertical Imputation (Division)
+      let businessVertical = (bv !== undefined && bv !== null && String(bv).trim() !== "") ? String(bv).trim() : String(division || "").trim();
+      
+      // Step 3: Business Vertical Standardization (EPR)
+      if (businessVertical === "EPR") {
         businessVertical = "Plastic Operations";
       }
 
-      // Filter irrelevant verticals
-      if (businessVertical && ['admin', 'it', 'social inclusion', 'prf job work', 'qehs', 'marketing', 'general'].includes(String(businessVertical).trim().toLowerCase())) {
-        return null;
+      // Step 4: Business Vertical Filtering (Admin, IT, Marketing, etc.)
+      const nonCore = ['admin', 'it', 'marketing', 'social inclusion', 'prf job work', 'qehs', 'general'];
+      if (nonCore.includes(businessVertical.toLowerCase())) {
+        return null; // Remove row
       }
 
-      if (businessVertical && String(businessVertical).trim() === "ZWP-Sales") {
+      // Step 5: Business Vertical Standardization (ZWP-Sales)
+      if (businessVertical === "ZWP-Sales") {
         businessVertical = "ZWP Sales";
       }
 
-      if (businessVertical && /ewaste/i.test(String(businessVertical))) {
+      // Step 6: Business Vertical Standardization (Ewaste spellings check)
+      if (/ewaste|e-waste|e\s+waste/i.test(businessVertical) || businessVertical.toLowerCase().includes("refurbishment")) {
         businessVertical = "Ewaste";
       }
 
-      // Impute null Invoice Status
-      let finalStatus = invoiceStatus || "";
-      if (!finalStatus && rejectionComments) {
-        finalStatus = "Rejected Invoices";
-      } else if (!finalStatus && (paymentDate || bookingStatus === "Booked")) {
-        finalStatus = "Full Paid Invoices";
-      } else if (!finalStatus && (balance === 0 || balance === null || balance === undefined)) {
-        finalStatus = "Full Paid Invoices";
+      // Step 8: Expense Type Imputation
+      let expenseType = "Blanks Expense";
+      if (expenseTypeRaw !== undefined && expenseTypeRaw !== null && String(expenseTypeRaw).trim() !== "") {
+        expenseType = String(expenseTypeRaw).trim();
       }
 
-      // Debit Note imputation
-      let finalDebitNote = debitNote;
-      if (finalStatus === "Full Paid Invoices" && (debitNote === null || debitNote === undefined || debitNote === "")) {
-        finalDebitNote = 0;
+      // Step 9: Invoice Status Imputation (Rejection Comments)
+      let invoiceStatus = getValCaseInsensitive(row, 'Invoice Status', ['invoice_status', 'status']) || "";
+      invoiceStatus = String(invoiceStatus).trim();
+      
+      if (rejectionComments && String(rejectionComments).trim() !== "") {
+        invoiceStatus = "Rejected Invoices";
       }
 
-      // Details splitting
-      let itemName = getValCaseInsensitive(row, 'Item Name', ['item_name', 'item']) || "";
-      let rate = getValCaseInsensitive(row, 'Rate per unit', ['rate_per_unit', 'rate']) || 0;
-      let qty = getValCaseInsensitive(row, 'Quantity', ['quantity', 'qty']) || 1;
-      let total = totalAmount || 0;
+      // Step 10: Invoice Status Imputation (Payment Date / Booking Status)
+      if (!invoiceStatus || invoiceStatus === "") {
+        if ((paymentDate && String(paymentDate).trim() !== "") || String(bookingStatus).trim() === "Booked") {
+          invoiceStatus = "Full Paid Invoices";
+        }
+      }
 
-      // Populate row values
+      // Step 11: Invoice Status Imputation (Balance)
+      if (!invoiceStatus || invoiceStatus === "") {
+        const numBal = Number(balance);
+        if (balance === undefined || balance === null || balance === "" || numBal === 0 || isNaN(numBal)) {
+          invoiceStatus = "Full Paid Invoices";
+        }
+      }
+
+      // Step 12: Debit Note Imputation
+      let debitNote = debitNoteRaw;
+      if (invoiceStatus === "Full Paid Invoices") {
+        if (debitNote === undefined || debitNote === null || String(debitNote).trim() === "") {
+          debitNote = 0;
+        } else {
+          debitNote = Number(debitNote);
+        }
+      }
+
+      // Setup raw metadata to pass down to exploded rows
       newRow['Invoice #'] = invoiceNumber || ("BILL-TEMP-" + Math.floor(Math.random() * 100000));
-      newRow['Vendor Name'] = String(vendorName).toUpperCase();
-      newRow['Submission Date'] = submissionDate || new Date().toISOString().slice(0, 10);
-      newRow['Invoice Status'] = finalStatus || "Open";
-      newRow['Debit Note'] = finalDebitNote !== undefined ? Number(finalDebitNote) : "";
-      newRow['Business Vertical'] = businessVertical || "";
+      newRow['Vendor Name'] = vendorName;
+      newRow['Submission Date'] = submissionDateRaw || new Date().toISOString().slice(0, 10);
+      newRow['Invoice Status'] = invoiceStatus || "Open";
+      newRow['Debit Note'] = debitNote;
+      newRow['Business Vertical'] = businessVertical;
       newRow['Division'] = division || "";
-      newRow['Expense Type'] = expenseType || "Blanks Expense";
-      newRow['Item Name'] = itemName;
-      newRow['Rate per unit'] = Number(rate) || 0;
-      newRow['Quantity'] = Number(qty) || 0;
-      newRow['Total Amount'] = Number(total) || 0;
-      newRow['Category'] = getValCaseInsensitive(row, 'Category') || "Others";
+      newRow['Expense Type'] = expenseType;
+      newRow['Category'] = getValCaseInsensitive(row, 'Category') || "";
       newRow['GST Identification Number (GSTIN)'] = getValCaseInsensitive(row, 'GST Identification Number (GSTIN)') || "";
       newRow['Vendor Status'] = getValCaseInsensitive(row, 'Vendor Status') || "";
       newRow['Type'] = getValCaseInsensitive(row, 'Type') || "";
-      newRow['Compliance Status'] = getValCaseInsensitive(row, 'Compliance Status') || "Non-compliant";
-      newRow['City'] = getValCaseInsensitive(row, 'City') || "";
-
-      // Drop BESCOM or PUMA
-      if (vendorName && /BESCOM|PUMA/i.test(String(vendorName))) {
-        return null;
-      }
+      newRow['City'] = cityRaw || "";
+      
+      // Store raw details and amounts for split phase
+      newRow['_raw_details'] = detailsRaw;
+      newRow['_raw_total_amount'] = totalAmountRaw;
+      newRow['_raw_sum_of_base'] = sumOfBaseAmountRaw;
+      newRow['_raw_sum_of_total'] = sumOfTotalAmountRaw;
 
       return newRow;
     }).filter(Boolean) as any[];
 
-    // Keep only targeted columns
+    // Step 14 & 15: Details Column Standardization & Splitting
+    let explodedRows: any[] = [];
+    tempRows.forEach(row => {
+      let details = String(row['_raw_details'] || "").trim();
+      
+      // Step 14: Details Column Standardization using Lookup Table if available
+      if (lookups?.itemDetailsMap && lookups.itemDetailsMap[details]) {
+        details = lookups.itemDetailsMap[details];
+      }
+
+      const totalAmountRaw = row['_raw_total_amount'];
+      const sumOfBaseAmount = parseFloat(row['_raw_sum_of_base']) || 0;
+      const sumOfTotalAmount = parseFloat(row['_raw_sum_of_total']) || 0;
+
+      if (details) {
+        // Explode comma separated details
+        // Replace 'FY 20-21' with 'FY 20_21' to avoid splitting years
+        const normalizedDetails = details.replace(/FY\s*20-21/gi, 'FY 20_21');
+        const detailLines = normalizedDetails.split(',').map(p => p.trim()).filter(Boolean);
+
+        detailLines.forEach(line => {
+          // Split by dash followed by a digit
+          const subParts = line.split(/-(?=\d)/);
+          const itemName = (subParts[0] || "").trim();
+          let rate = parseFloat(subParts[1]) || 0;
+          let qty = parseFloat(subParts[2]) || 0;
+          let totalAmount = parseFloat(subParts[3]) || 0;
+
+          // Step 19: Total Amount Imputation
+          if ((totalAmount === 0 || isNaN(totalAmount)) && itemName === line && sumOfBaseAmount > 0) {
+            totalAmount = sumOfBaseAmount;
+          }
+
+          explodedRows.push({
+            ...row,
+            'Details': line,
+            'Item Name': itemName,
+            'Rate per unit': rate,
+            'Quantity': qty,
+            'Total Amount': totalAmount,
+          });
+        });
+      } else {
+        // No details column, get item name directly
+        const itemName = getValCaseInsensitive(row, 'Item Name', ['item_name', 'item']) || "";
+        let rate = parseFloat(getValCaseInsensitive(row, 'Rate per unit', ['rate_per_unit', 'rate'])) || 0;
+        let qty = parseFloat(getValCaseInsensitive(row, 'Quantity', ['quantity', 'qty'])) || 0;
+        let totalAmount = parseFloat(totalAmountRaw) || 0;
+
+        explodedRows.push({
+          ...row,
+          'Details': '',
+          'Item Name': String(itemName).trim(),
+          'Rate per unit': rate,
+          'Quantity': qty,
+          'Total Amount': totalAmount,
+        });
+      }
+    });
+
+    // Step 16: Business Vertical Reclassification (Refurbishment)
+    explodedRows.forEach(row => {
+      const vendorNameUpper = String(row['Vendor Name']).trim().toUpperCase();
+      const itemNameUpper = String(row['Item Name']).trim().toUpperCase();
+      
+      if (lookups?.refurbishmentItems) {
+        const isRefurb = lookups.refurbishmentItems.some(
+          item => item.vendor === vendorNameUpper && item.item === itemNameUpper
+        );
+        if (isRefurb) {
+          row['Business Vertical'] = 'Refurbishment';
+        }
+      }
+    });
+
+    // Step 17: Drop Rows with Critical Missing Values
+    let cleanRows = explodedRows.filter(row => {
+      const vendor = row['Vendor Name'];
+      const item = row['Item Name'];
+      const date = row['Submission Date'];
+      return vendor && item && date && String(vendor).trim() !== "" && String(item).trim() !== "" && String(date).trim() !== "";
+    });
+
+    // Step 20 & 21: Filter Out Specific MRF and Vendor Entries
+    cleanRows = cleanRows.filter(row => {
+      const bv = row['Business Vertical'];
+      const status = row['Invoice Status'];
+      const rate = Number(row['Rate per unit']) || 0;
+      const total = Number(row['Total Amount']) || 0;
+      const vendor = String(row['Vendor Name']).toUpperCase().trim();
+
+      // Step 20: Filter Out Specific MRF Entries
+      if (bv === 'MRF' && status === 'Full Paid Invoices' && rate === 0 && total === 0) {
+        return false;
+      }
+      // Step 21: Filter Out Specific Vendor Entries
+      if (vendor === 'SHRI MUNESWARA SWAMI PRASANNA' && status === 'Full Paid Invoices' && rate === 0 && total === 0) {
+        return false;
+      }
+      return true;
+    });
+
+    // Step 22: Rate per Unit Calculation
+    cleanRows.forEach(row => {
+      let rate = Number(row['Rate per unit']) || 0;
+      const qty = Number(row['Quantity']) || 0;
+      const total = Number(row['Total Amount']) || 0;
+      if (rate === 0 && qty !== 0) {
+        row['Rate per unit'] = total / qty;
+      }
+    });
+
+    // Step 23: Total Amount Adjustment (GST Purchases)
+    cleanRows.forEach(row => {
+      const status = row['Invoice Status'];
+      const expenseType = row['Expense Type'];
+      const itemName = row['Item Name'];
+      const sumOfTotalAmount = parseFloat(row['_raw_sum_of_total']) || 0;
+
+      if (status === 'Full Paid Invoices' && expenseType === 'GST Purchases' && ['CEEW1 - LED', 'LCD'].includes(itemName) && sumOfTotalAmount > 0) {
+        row['Total Amount'] = sumOfTotalAmount / 1.18;
+      }
+    });
+
+    // Step 24: Item Deletion (marked for deletion in category lookup table)
+    if (lookups?.purchaseCategoryMap) {
+      cleanRows = cleanRows.filter(row => {
+        const itemUpper = String(row['Item Name']).trim().toUpperCase();
+        return !(lookups.purchaseCategoryMap[itemUpper]?.delete);
+      });
+    }
+
+    // Step 25: Hierarchical Median Imputation (Rate per unit & Quantity)
+    const fpRows = cleanRows.filter(row => row['Invoice Status'] === 'Full Paid Invoices');
+    
+    const rateGroupLvl1: Record<string, number[]> = {};
+    const rateGroupLvl2: Record<string, number[]> = {};
+    const rateGlobalList: number[] = [];
+    
+    const qtyGroupLvl1: Record<string, number[]> = {};
+    const qtyGroupLvl2: Record<string, number[]> = {};
+    const qtyGlobalList: number[] = [];
+
+    fpRows.forEach(row => {
+      const bv = String(row['Business Vertical']).trim();
+      const item = String(row['Item Name']).trim();
+      const rate = Number(row['Rate per unit']);
+      const qty = Number(row['Quantity']);
+      const keyLvl1 = `${bv}_${item}`;
+
+      if (!isNaN(rate) && rate > 0) {
+        if (!rateGroupLvl1[keyLvl1]) rateGroupLvl1[keyLvl1] = [];
+        rateGroupLvl1[keyLvl1].push(rate);
+
+        if (!rateGroupLvl2[bv]) rateGroupLvl2[bv] = [];
+        rateGroupLvl2[bv].push(rate);
+
+        rateGlobalList.push(rate);
+      }
+
+      if (!isNaN(qty) && qty > 0) {
+        if (!qtyGroupLvl1[keyLvl1]) qtyGroupLvl1[keyLvl1] = [];
+        qtyGroupLvl1[keyLvl1].push(qty);
+
+        if (!qtyGroupLvl2[bv]) qtyGroupLvl2[bv] = [];
+        qtyGroupLvl2[bv].push(qty);
+
+        qtyGlobalList.push(qty);
+      }
+    });
+
+    const getMedian = (arr: number[]): number => {
+      if (!arr || arr.length === 0) return 0;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    };
+
+    const rateLvl1Medians: Record<string, number> = {};
+    Object.keys(rateGroupLvl1).forEach(k => { rateLvl1Medians[k] = getMedian(rateGroupLvl1[k]); });
+    const rateLvl2Medians: Record<string, number> = {};
+    Object.keys(rateGroupLvl2).forEach(k => { rateLvl2Medians[k] = getMedian(rateGroupLvl2[k]); });
+    const rateGlobalMedian = getMedian(rateGlobalList);
+
+    const qtyLvl1Medians: Record<string, number> = {};
+    Object.keys(qtyGroupLvl1).forEach(k => { qtyLvl1Medians[k] = getMedian(qtyGroupLvl1[k]); });
+    const qtyLvl2Medians: Record<string, number> = {};
+    Object.keys(qtyGroupLvl2).forEach(k => { qtyLvl2Medians[k] = getMedian(qtyGroupLvl2[k]); });
+    const qtyGlobalMedian = getMedian(qtyGlobalList);
+
+    cleanRows.forEach(row => {
+      if (row['Invoice Status'] === 'Full Paid Invoices') {
+        const bv = String(row['Business Vertical']).trim();
+        const item = String(row['Item Name']).trim();
+        const keyLvl1 = `${bv}_${item}`;
+        
+        let rate = Number(row['Rate per unit']);
+        let qty = Number(row['Quantity']);
+
+        if (isNaN(rate) || rate === 0) {
+          rate = rateLvl1Medians[keyLvl1] || rateLvl2Medians[bv] || rateGlobalMedian || 0;
+          row['Rate per unit'] = rate;
+          imputedCount++;
+        }
+
+        if (isNaN(qty) || qty === 0) {
+          qty = qtyLvl1Medians[keyLvl1] || qtyLvl2Medians[bv] || qtyGlobalMedian || 0;
+          row['Quantity'] = qty;
+          imputedCount++;
+        }
+
+        // Step 26: Recalculate Total Amount
+        row['Total Amount'] = rate * qty;
+      }
+    });
+
+    // Step 27: Filter by Expense Type
+    const validExpenseTypes = [
+      'GST Purchases', 'Operations-Transpotation Charges', 'Purchases from Unregistered dealer',
+      'Consumables', 'Professional Service Fees', 'Admin-Professional & Consultancy Charges',
+      'Scrap Handling & Transporatation', 'Office Stationary and Consumables', 'Operation A - PPE and Consumables',
+      'Consultants-Sales, BD, cRM', 'Operations-Rejects/ Wet Waste Collection', 'Operations-Stationary N Printing',
+      'Raw Materials', 'Auditing and Company Sec Charges', 'Website Development Charges',
+      'Operations Communication Expenses', 'Operation-Shredding & Baling Charges', 'Blank Expense', 'Blanks Expense'
+    ].map(e => e.toLowerCase().trim());
+
+    cleanRows = cleanRows.filter(row => {
+      const exp = String(row['Expense Type'] || "").toLowerCase().trim();
+      return validExpenseTypes.includes(exp);
+    });
+
+    // Step 28: Category Imputation
+    cleanRows.forEach(row => {
+      const itemName = String(row['Item Name']).trim();
+      const itemUpper = itemName.toUpperCase();
+      let category = "";
+
+      if (lookups?.purchaseCategoryMap && lookups.purchaseCategoryMap[itemUpper]) {
+        category = lookups.purchaseCategoryMap[itemUpper].category;
+      } else {
+        const localCat = categorize(itemName);
+        if (localCat) category = localCat;
+      }
+
+      // Apply overrides (Redenim, Sarvam, Milestone)
+      if (/Redenim/i.test(itemName)) {
+        category = 'Bags';
+      } else if (/Sarvam.*Monitoring/i.test(itemName) || itemName === 'GUN ‐ COMMERCIAL') {
+        category = 'Others';
+      } else if (/Milestone/i.test(itemName)) {
+        category = 'IT';
+      }
+
+      if (!category) {
+        category = "Others";
+      }
+
+      row['Category'] = category;
+    });
+
+    // Step 29: Drop Missing Categories
+    cleanRows = cleanRows.filter(row => {
+      const cat = row['Category'];
+      return cat && String(cat).trim() !== "";
+    });
+
+    // Step 30: Remove Duplicate Rows (Deduplicate)
+    const seen = new Set();
+    cleanRows = cleanRows.filter(row => {
+      const key = `${row['Invoice #']}-${row['Item Name']}-${row['Total Amount']}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // Step 31 to 37: Vendor master cleanse and mapping
+    let finalRows: any[] = [];
+    cleanRows.forEach(row => {
+      const vendorNameRaw = String(row['Vendor Name']).trim();
+      const vendorNameUpper = vendorNameRaw.toUpperCase();
+
+      // Step 36: Vendor Name Standardization (BESCOM / PUMA drop)
+      if (vendorNameUpper.includes("BESCOM") || vendorNameUpper.includes("PUMA")) {
+        return; // drop row
+      }
+      row['Vendor Name'] = vendorNameUpper;
+
+      // Get standardized lookup data from vendorsMap
+      const vendorDetails = lookups?.vendorsMap ? lookups.vendorsMap[vendorNameUpper] : null;
+
+      // Step 33: Filter Out Rejected Invoices
+      if (row['Invoice Status'] === 'Rejected Invoices') {
+        return; // drop row
+      }
+
+      // Step 34: Filter Out Inactive Vendors
+      if (vendorDetails?.status === 'Vendor Inactive.') {
+        return; // drop row
+      }
+
+      // Fill GSTIN, Vendor Status, Type from lookup if available
+      if (vendorDetails) {
+        if (vendorDetails.gstin) {
+          row['GST Identification Number (GSTIN)'] = vendorDetails.gstin;
+        }
+        if (vendorDetails.status) {
+          row['Vendor Status'] = vendorDetails.status;
+        }
+        if (vendorDetails.type) {
+          row['Type'] = vendorDetails.type;
+        }
+      }
+
+      // Step 37: City Imputation
+      const currentCity = String(row['City'] || "").trim();
+      if (!currentCity && vendorDetails?.city) {
+        row['City'] = vendorDetails.city;
+      }
+
+      // Step 35: Compliance Status Imputation
+      let compliance = 'Non-compliant';
+      const gstin = String(row['GST Identification Number (GSTIN)'] || "").trim();
+      const vendorStatus = String(row['Vendor Status'] || "").trim();
+      const type = String(row['Type'] || "").trim();
+
+      if (gstin && gstin !== "") {
+        compliance = 'Compliant';
+      } else if (['Vendor Registered.', 'Vendor Validated.'].includes(vendorStatus)) {
+        compliance = 'Compliant';
+      } else if (type === 'Registered') {
+        compliance = 'Compliant';
+      } else if (type === 'Unregistered') {
+        compliance = 'Non-compliant';
+      }
+
+      if (row['Expense Type'] === 'GST Purchases') {
+        compliance = 'Compliant';
+      }
+
+      row['Compliance Status'] = compliance;
+
+      // Clean up temporary properties that shouldn't leak to schema
+      delete row['_raw_sum_of_total'];
+
+      finalRows.push(row);
+    });
+
+    // Map to exact target columns schema
     const purchaseCols = [
       'Invoice #', 'Vendor Name', 'Submission Date', 'Invoice Status', 'Debit Note',
       'Business Vertical', 'Division', 'Expense Type', 'Item Name', 'Rate per unit',
       'Quantity', 'Total Amount', 'Category', 'GST Identification Number (GSTIN)',
       'Vendor Status', 'Type', 'Compliance Status', 'City'
     ];
-    
-    const finalRows = tempRows.map(row => {
+
+    const processedRows = finalRows.map(row => {
       const finalRow: Record<string, any> = {};
       purchaseCols.forEach(col => {
         let val = row[col];
@@ -382,16 +783,7 @@ export function cleanDataTS(type: "sales" | "purchase", data: any[]): { cleaned:
       return finalRow;
     });
 
-    // Deduplicate
-    const seen = new Set();
-    const uniqueRows = finalRows.filter(row => {
-      const key = `${row['Invoice #']}-${row['Item Name']}-${row['Total Amount']}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    return { cleaned: uniqueRows, imputedCount };
+    return { cleaned: processedRows, imputedCount };
   }
 }
 
@@ -607,4 +999,231 @@ export const runPythonCleaning = createServerFn({ method: "POST" })
         }
       };
     }
+  });
+
+export const loadCleaningLookups = createServerFn({ method: "GET" })
+  .handler(async (): Promise<{
+    salesColumnsToKeep: string[];
+    salesCategoryMap: Record<string, string>;
+    itemDetailsMap: Record<string, string>;
+    refurbishmentItems: { vendor: string; item: string }[];
+    purchaseCategoryMap: Record<string, { category: string; delete: boolean }>;
+    vendorsMap: Record<string, { gstin: string; status: string; type: string; city: string }>;
+  }> => {
+    const fs = typeof window === "undefined" ? await import("fs") : null;
+    const path = typeof window === "undefined" ? await import("path") : null;
+    
+    if (!fs || !path) {
+      return {
+        salesColumnsToKeep: [],
+        salesCategoryMap: {},
+        itemDetailsMap: {},
+        refurbishmentItems: [],
+        purchaseCategoryMap: {},
+        vendorsMap: {},
+      };
+    }
+
+    const readRootFile = (fileName: string): Buffer | null => {
+      const p = path.join(process.cwd(), fileName);
+      if (fs.existsSync(p)) {
+        return fs.readFileSync(p);
+      }
+      return null;
+    };
+
+    // 1. Sales_lookup.csv
+    const salesColumnsToKeep: string[] = [];
+    const salesLookupBuf = readRootFile("Sales_lookup.csv");
+    if (salesLookupBuf) {
+      try {
+        const workbook = XLSX.read(salesLookupBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet, { header: 1 });
+        json.forEach((row: any) => {
+          if (row && row[0]) {
+            salesColumnsToKeep.push(String(row[0]).trim());
+          }
+        });
+      } catch (err) {
+        console.error("Error reading Sales_lookup.csv:", err);
+      }
+    }
+
+    // 2. Sales categories
+    const salesCategoryMap: Record<string, string> = {};
+    const salesCatBuf = readRootFile("Item_Cat_Update  saless.csv");
+    if (salesCatBuf) {
+      try {
+        const workbook = XLSX.read(salesCatBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet);
+        json.forEach((row: any) => {
+          const item = row["Item Name"] || row["item_name"] || row["Item"];
+          const cat = row["Category"] || row["category"];
+          if (item && cat) {
+            salesCategoryMap[String(item).trim().toUpperCase()] = String(cat).trim();
+          }
+        });
+      } catch (err) {
+        console.error("Error reading Item_Cat_Update  saless.csv:", err);
+      }
+    }
+    const salesExcelCatBuf = readRootFile("Item_Cat_Sales_Update (1).xlsx");
+    if (salesExcelCatBuf) {
+      try {
+        const workbook = XLSX.read(salesExcelCatBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet);
+        json.forEach((row: any) => {
+          const item = row["Item"] || row["Item Name"] || row["item_name"];
+          const cat = row["Category"] || row["category"];
+          if (item && cat) {
+            salesCategoryMap[String(item).trim().toUpperCase()] = String(cat).trim();
+          }
+        });
+      } catch (err) {
+        console.error("Error reading Item_Cat_Sales_Update (1).xlsx:", err);
+      }
+    }
+
+    // 3. item_details_lookup_purchase.csv (details standardisation)
+    const itemDetailsMap: Record<string, string> = {};
+    const detailsBuf = readRootFile("item_details_lookup_purchase.csv");
+    if (detailsBuf) {
+      try {
+        const workbook = XLSX.read(detailsBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet);
+        json.forEach((row: any) => {
+          const orig = row["Details_lookup"] || row["Original"] || Object.values(row)[0];
+          const ref = row["Details Refined"] || row["Refined"] || Object.values(row)[1];
+          if (orig && ref) {
+            itemDetailsMap[String(orig).trim()] = String(ref).trim();
+          }
+        });
+      } catch (err) {
+        console.error("Error reading item_details_lookup_purchase.csv:", err);
+      }
+    }
+
+    // 4. Lookup_items.xls (Refurbishment lookup)
+    const refurbishmentItems: { vendor: string; item: string }[] = [];
+    const lookupItemsBuf = readRootFile("Lookup_items.xls");
+    if (lookupItemsBuf) {
+      try {
+        const workbook = XLSX.read(lookupItemsBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet);
+        json.forEach((row: any) => {
+          const vendorCol = Object.keys(row).find(k => /vendor/i.test(k));
+          const itemCol = Object.keys(row).find(k => /item/i.test(k));
+          if (vendorCol && itemCol && row[vendorCol] && row[itemCol]) {
+            refurbishmentItems.push({
+              vendor: String(row[vendorCol]).trim().toUpperCase(),
+              item: String(row[itemCol]).trim().toUpperCase(),
+            });
+          }
+        });
+      } catch (err) {
+        console.error("Error reading Lookup_items.xls:", err);
+      }
+    }
+
+    // 5. Purchase_Items_Lookup_Category.csv
+    const purchaseCategoryMap: Record<string, { category: string; delete: boolean }> = {};
+    const purchaseCatBuf = readRootFile("Purchase_Items_Lookup_Category.csv");
+    if (purchaseCatBuf) {
+      try {
+        const workbook = XLSX.read(purchaseCatBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet);
+        json.forEach((row: any) => {
+          const item = row["Item Name"] || row["item_name"] || row["Item"];
+          const cat = row["Category"] || row["category"];
+          const delVal = row["Delete"] !== undefined && row["Delete"] !== null && String(row["Delete"]).trim() !== "";
+          if (item && cat) {
+            purchaseCategoryMap[String(item).trim().toUpperCase()] = {
+              category: String(cat).trim(),
+              delete: delVal,
+            };
+          }
+        });
+      } catch (err) {
+        console.error("Error reading Purchase_Items_Lookup_Category.csv:", err);
+      }
+    }
+
+    // 6. Vendors_Status.csv
+    const vendorsMap: Record<string, { gstin: string; status: string; type: string; city: string }> = {};
+    const vendorsBuf = readRootFile("Vendors_Status.csv");
+    if (vendorsBuf) {
+      try {
+        const workbook = XLSX.read(vendorsBuf, { type: "buffer" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const json = XLSX.utils.sheet_to_json<any>(sheet);
+        
+        const rawVendors: any[] = json.map((row: any) => {
+          const name = String(row["Vendor Name"] || "").trim().toUpperCase();
+          let status = String(row["Vendor Status"] || "").trim();
+          if (status === "Vendor Registered") status = "Vendor Registered.";
+          
+          let type = String(row["Type"] || "").trim();
+          if (type === "Unregistered Business") {
+            type = "Unregistered";
+          } else if (["Registered Business - Regular", "Registered Business - Composition", "Registered Business"].includes(type)) {
+            type = "Registered";
+          }
+          
+          return {
+            name,
+            gstin: String(row["GST Identification Number (GSTIN)"] || "").trim(),
+            status,
+            type,
+            city: String(row["City"] || "").trim(),
+          };
+        }).filter(v => v.name);
+
+        const nameCounts: Record<string, number> = {};
+        rawVendors.forEach(v => {
+          nameCounts[v.name] = (nameCounts[v.name] || 0) + 1;
+        });
+
+        const uniqueVendors = rawVendors.filter(v => nameCounts[v.name] === 1);
+        const duplicateVendors = rawVendors.filter(v => nameCounts[v.name] > 1);
+
+        uniqueVendors.forEach(v => {
+          vendorsMap[v.name] = { gstin: v.gstin, status: v.status, type: v.type, city: v.city };
+        });
+
+        const validStatus = ["Vendor Validated.", "Vendor Registered.", "SZW POC Verified."];
+        const validVendorsNames = new Set(
+          duplicateVendors.filter(v => validStatus.includes(v.status)).map(v => v.name)
+        );
+
+        const resolvedDuplicates: Record<string, any> = {};
+        duplicateVendors.forEach(v => {
+          const hasValid = validVendorsNames.has(v.name);
+          if (hasValid && !validStatus.includes(v.status)) {
+            return;
+          }
+          if (!resolvedDuplicates[v.name]) {
+            resolvedDuplicates[v.name] = { gstin: v.gstin, status: v.status, type: v.type, city: v.city };
+          }
+        });
+
+        Object.assign(vendorsMap, resolvedDuplicates);
+      } catch (err) {
+        console.error("Error reading Vendors_Status.csv:", err);
+      }
+    }
+
+    return {
+      salesColumnsToKeep,
+      salesCategoryMap,
+      itemDetailsMap,
+      refurbishmentItems,
+      purchaseCategoryMap,
+      vendorsMap,
+    };
   });

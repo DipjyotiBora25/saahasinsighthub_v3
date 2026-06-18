@@ -27,7 +27,7 @@ import { MetricCard } from "@/components/data/MetricCard";
 import { Logo } from "@/components/brand/Logo";
 import * as XLSX from "xlsx";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { runPythonCleaning, cleanDataTS, normalizeDate, type LogLine } from "@/lib/cleaning.functions";
+import { runPythonCleaning, cleanDataTS, normalizeDate, loadCleaningLookups, type LogLine } from "@/lib/cleaning.functions";
 
 import { syncZohoBooks, type SyncResult } from "@/lib/zoho.functions";
 import {
@@ -469,20 +469,27 @@ if os.path.exists("raw_purchase.csv"):
     find_and_rename_col(purchase_df, 'Sum of Total Amount', ['Sum of Total Amount', 'sum_of_total_amount', 'sum_total_amount'])
     find_and_rename_col(purchase_df, 'Vendor Code', ['Vendor Code', 'vendor_code', 'vendor code'])
     
-    # Step 1: Initial Assessment & Column-Level Imputation
+    # Step 1: Initial Missing Value Check
+    print("Initial Missing Value Check:")
+    print(purchase_df.isnull().sum())
+    
+    # Step 2: Business Vertical Imputation (Division)
     if 'Business Vertical' in purchase_df.columns and 'Division' in purchase_df.columns:
         purchase_df['Business Vertical'] = purchase_df['Business Vertical'].fillna(purchase_df['Division'])
         
-    # Impute EPR Business Vertical with Plastic Operations
+    # Step 3: Business Vertical Standardization (EPR)
     if 'Business Vertical' in purchase_df.columns:
         purchase_df.loc[purchase_df['Business Vertical'] == 'EPR', 'Business Vertical'] = 'Plastic Operations'
         
-    # Step 2: Structural Filtering & String Harmonization
+    # Step 4: Business Vertical Filtering
     if 'Business Vertical' in purchase_df.columns:
         purchase_df = purchase_df[~purchase_df['Business Vertical'].isin(['Admin', 'IT', 'Social Inclusion', 'PRF Job Work', 'QEHS', 'Marketing', 'General'])]
+        
+    # Step 5: Business Vertical Standardization (ZWP-Sales)
+    if 'Business Vertical' in purchase_df.columns:
         purchase_df.loc[purchase_df['Business Vertical'] == 'ZWP-Sales', 'Business Vertical'] = 'ZWP Sales'
         
-    # Standardize ewaste vertical using fuzzy matching logic or substring check
+    # Step 6: Business Vertical Standardization (Ewaste spellings check)
     try:
         from thefuzz import process
         has_fuzz = True
@@ -504,39 +511,39 @@ if os.path.exists("raw_purchase.csv"):
         purchase_df['Business Vertical'] = purchase_df['Business Vertical'].apply(standardize_ewaste)
         print("Standardized Business Verticals (Ewaste).")
         
-    # Drop empty vendor names
+    # Step 7: Drop Missing Vendor Names
     purchase_df = purchase_df.dropna(subset=['Vendor Name'])
     
-    # Impute blank Expense Type
+    # Step 8: Expense Type Imputation
     if 'Expense Type' in purchase_df.columns:
         purchase_df['Expense Type'] = purchase_df['Expense Type'].fillna('Blanks Expense')
         
-    # Step 3: Heuristic & Conditional Invoice Status Imputation
+    # Step 9: Invoice Status Imputation (Rejection Comments)
     if 'Invoice Status' in purchase_df.columns:
         rejection_comments_notnull = purchase_df['Rejection Comments'].notnull() if 'Rejection Comments' in purchase_df.columns else pd.Series([False]*len(purchase_df))
         purchase_df.loc[rejection_comments_notnull & purchase_df['Invoice Status'].isnull(), 'Invoice Status'] = 'Rejected Invoices'
         
-        # Impute Fully Paid Invoices if Payment Date is not null or Booking status is 'Booked'
+        # Step 10: Invoice Status Imputation (Payment Date / Booking Status)
         pay_date_notnull = purchase_df['Payment Date'].notnull() if 'Payment Date' in purchase_df.columns else pd.Series([False]*len(purchase_df))
         booking_booked = (purchase_df['Booking status (For Accounts only)'] == 'Booked') if 'Booking status (For Accounts only)' in purchase_df.columns else pd.Series([False]*len(purchase_df))
         purchase_df.loc[((pay_date_notnull | booking_booked) & (purchase_df['Invoice Status'].isnull())), 'Invoice Status'] = 'Full Paid Invoices'
         
-        # Impute Full Paid Invoices if Balance is 0 or null
+        # Step 11: Invoice Status Imputation (Balance)
         bal_vals = purchase_df['Balance'] if 'Balance' in purchase_df.columns else pd.Series([np.nan]*len(purchase_df))
         purchase_df.loc[((bal_vals == 0) | (bal_vals.isnull())) & (purchase_df['Invoice Status'].isnull()), 'Invoice Status'] = 'Full Paid Invoices'
         
-    # Impute Debit Note = 0 if status is Full Paid Invoices
+    # Step 12: Debit Note Imputation
     if 'Invoice Status' in purchase_df.columns and 'Debit Note' in purchase_df.columns:
         purchase_df.loc[purchase_df['Invoice Status'] == 'Full Paid Invoices', 'Debit Note'] = purchase_df.loc[purchase_df['Invoice Status'] == 'Full Paid Invoices', 'Debit Note'].fillna(0)
         
-    # Step 4: Dimensionality Reduction & Text Decomposition
+    # Step 13: Column Dropping (dropped at the end mapping to keep logic parameters)
     drop_cols = ['Finance Comments', 'Rejection Comments', 'Credit Note', 'Balance', 'Approved date by Lead',
                  'Payment Type', 'Document Type', 'Payment Due on', 'Payment Date', 'Any Special Requests', 'Transaction No']
     purchase_df.drop(columns=[c for c in drop_cols if c in purchase_df.columns], inplace=True, errors='ignore')
     
     df_reordered = purchase_df.copy()
     
-    # Replace Details using details replacement lookup
+    # Step 14: Details Column Standardization using lookup
     if os.path.exists(item_details_lookup_path) and 'Details' in df_reordered.columns:
         item_details_lookup_df = pd.read_csv(item_details_lookup_path)
         orig_col = 'Original' if 'Original' in item_details_lookup_df.columns else ('Details_lookup' if 'Details_lookup' in item_details_lookup_df.columns else item_details_lookup_df.columns[0])
@@ -545,7 +552,7 @@ if os.path.exists("raw_purchase.csv"):
         for index, row in item_details_lookup_df.iterrows():
             df_reordered.loc[df_reordered['Details'] == row[orig_col], 'Details'] = row[ref_col]
             
-    # Split Details column to get Item Name, Quantity and Rate per unit
+    # Step 15: Details Column Splitting
     if 'Details' in df_reordered.columns:
         df_reordered['Details'] = df_reordered['Details'].astype(str).str.replace('FY 20-21', 'FY 20_21')
         df_reordered = df_reordered.assign(Details=df_reordered['Details'].str.split(',')) \
@@ -569,8 +576,7 @@ if os.path.exists("raw_purchase.csv"):
         
     df_updated = df_final.copy()
     
-    # Step 5: Domain-Specific Business Rule Cleansing
-    # Lookup for items matching in Lookup_items.xls / Lookup_items.csv
+    # Step 16: Business Vertical Reclassification (Refurbishment)
     df_lookup = None
     if os.path.exists(lookup_items_path):
         df_lookup = pd.read_excel(lookup_items_path)
@@ -589,45 +595,44 @@ if os.path.exists("raw_purchase.csv"):
                 if len(match_rows) > 0:
                     df_updated.at[index, 'Business Vertical'] = 'Refurbishment'
                     
-    # Secondary Complete Case Constraint
+    # Step 17: Drop Rows with Critical Missing Values
     df_updated = df_updated.dropna(subset=[c for c in ['Vendor Name', 'Item Name', 'Submission Date'] if c in df_updated.columns], how='any')
+    
+    # Step 18: Drop Vendor Code
     df_updated.drop(['Vendor Code'], axis=1, inplace=True, errors='ignore')
     
-    # Impute empty Total Amount with Sum of Base Amount
-    if 'Total Amount' in df_updated.columns and 'Sum of Base Amount' in df_updated.columns:
+    # Step 19: Total Amount Imputation
+    if 'Total Amount' in df_updated.columns and 'Sum of Base Amount' in df_updated.columns and 'Item Name' in df_updated.columns and 'Details' in df_updated.columns:
         df_updated['Total Amount'] = pd.to_numeric(df_updated['Total Amount'], errors='coerce')
         df_updated['Sum of Base Amount'] = pd.to_numeric(df_updated['Sum of Base Amount'], errors='coerce')
-        condition = (df_updated['Total Amount'].isnull() | (df_updated['Total Amount'] == 0)) & df_updated['Sum of Base Amount'].notnull()
+        details_match = df_updated['Item Name'].astype(str).str.strip() == df_updated['Details'].astype(str).str.strip()
+        condition = (df_updated['Total Amount'].isnull() | (df_updated['Total Amount'] == 0)) & details_match & df_updated['Sum of Base Amount'].notnull()
         df_updated.loc[condition, 'Total Amount'] = df_updated.loc[condition, 'Sum of Base Amount']
         
-    # Check for Business Vertical = MRF and drop if total & rate are 0
+    # Step 20 & 21: Filter Out Specific MRF and Vendor Entries
     if 'Business Vertical' in df_updated.columns and 'Invoice Status' in df_updated.columns and 'Rate per unit' in df_updated.columns and 'Total Amount' in df_updated.columns:
         df_updated['Rate per unit'] = pd.to_numeric(df_updated['Rate per unit'], errors='coerce').fillna(0)
         df_updated['Total Amount'] = pd.to_numeric(df_updated['Total Amount'], errors='coerce').fillna(0)
         df_updated = df_updated[
-            ~(
-                (df_updated['Business Vertical'].isin(['MRF'])) &
-                (df_updated['Invoice Status'] == 'Full Paid Invoices') &
-                (df_updated['Rate per unit'] == 0) &
-                (df_updated['Total Amount'] == 0)
-            )
+            ~((df_updated['Business Vertical'].isin(['MRF'])) &
+              (df_updated['Invoice Status'] == 'Full Paid Invoices') &
+              (df_updated['Rate per unit'] == 0) &
+              (df_updated['Total Amount'] == 0))
         ]
         df_updated = df_updated[
-            ~(
-                (df_updated['Vendor Name'] == 'Shri Muneswara Swami Prasanna') &
-                (df_updated['Invoice Status'] == 'Full Paid Invoices') &
-                (df_updated['Rate per unit'] == 0) &
-                (df_updated['Total Amount'] == 0)
-            )
+            ~((df_updated['Vendor Name'] == 'Shri Muneswara Swami Prasanna') &
+              (df_updated['Invoice Status'] == 'Full Paid Invoices') &
+              (df_updated['Rate per unit'] == 0) &
+              (df_updated['Total Amount'] == 0))
         ]
         
-    # Impute rate per unit if empty (Unit Rate Restoration)
+    # Step 22: Rate per Unit Calculation
     if 'Total Amount' in df_updated.columns and 'Quantity' in df_updated.columns and 'Rate per unit' in df_updated.columns:
         df_updated['Quantity'] = pd.to_numeric(df_updated['Quantity'], errors='coerce')
         condition = (df_updated['Rate per unit'] == 0) & (df_updated['Quantity'] != 0) & (df_updated['Quantity'].notnull())
         df_updated.loc[condition, 'Rate per unit'] = df_updated.loc[condition, 'Total Amount'] / df_updated.loc[condition, 'Quantity']
         
-    # GST Purchase Special LED/LCD imputation
+    # Step 23: Total Amount Adjustment (GST Purchases)
     if 'Invoice Status' in df_updated.columns and 'Expense Type' in df_updated.columns and 'Item Name' in df_updated.columns and 'Sum of Total Amount' in df_updated.columns:
         df_updated['Sum of Total Amount'] = pd.to_numeric(df_updated['Sum of Total Amount'], errors='coerce')
         condition = (
@@ -638,18 +643,14 @@ if os.path.exists("raw_purchase.csv"):
         )
         df_updated.loc[condition, 'Total Amount'] = df_updated.loc[condition, 'Sum of Total Amount'] / 1.18
         
-    # Step 6: Categorical Merges & Hierarchical Median Imputation
-    # Merge Purchase Items category mapping
+    # Step 24: Item Deletion
     if os.path.exists(purchase_items_lookup_cat_path) and 'Item Name' in df_updated.columns:
         df_lookup_group = pd.read_csv(purchase_items_lookup_cat_path)
-        if 'Category' in df_lookup_group.columns:
-            df_updated = df_updated.merge(df_lookup_group[['Item Name', 'Category']], on='Item Name', how='left')
-            
-            if 'Delete' in df_lookup_group.columns:
-                items_to_delete = df_lookup_group[df_lookup_group['Delete'].notna()]['Item Name']
-                df_updated = df_updated[~df_updated['Item Name'].isin(items_to_delete)]
+        if 'Delete' in df_lookup_group.columns:
+            items_to_delete = df_lookup_group[df_lookup_group['Delete'].notna()]['Item Name']
+            df_updated = df_updated[~df_updated['Item Name'].isin(items_to_delete)]
                 
-    # Hierarchical median imputation
+    # Step 25: Hierarchical Median Imputation (Rate per unit & Quantity)
     if 'Invoice Status' in df_updated.columns and 'Rate per unit' in df_updated.columns and 'Quantity' in df_updated.columns:
         df_fp = df_updated[df_updated['Invoice Status'] == 'Full Paid Invoices']
         if len(df_fp) > 0:
@@ -671,9 +672,10 @@ if os.path.exists("raw_purchase.csv"):
             df_updated.loc[mask_qty & df_updated['Quantity'].isna(), 'Quantity'] = df_updated.loc[mask_qty & df_updated['Quantity'].isna(), 'Business Vertical'].map(qty_lvl2)
             df_updated.loc[mask_qty & df_updated['Quantity'].isna(), 'Quantity'] = qty_global
             
+            # Step 26: Recalculate Total Amount
             df_updated['Total Amount'] = df_updated['Rate per unit'] * df_updated['Quantity']
             
-    # Expense Type Filtering
+    # Step 27: Filter by Expense Type
     if 'Expense Type' in df_updated.columns:
         valid_expense_types = [
             'GST Purchases', 'Operations-Transpotation Charges', 'Purchases from Unregistered dealer',
@@ -685,19 +687,24 @@ if os.path.exists("raw_purchase.csv"):
         ]
         df_updated = df_updated[df_updated['Expense Type'].isin(valid_expense_types)]
         
-    # Specific category updates
+    # Step 28: Category Imputation
+    if os.path.exists(purchase_items_lookup_cat_path) and 'Item Name' in df_updated.columns:
+        df_lookup_group = pd.read_csv(purchase_items_lookup_cat_path)
+        if 'Category' in df_lookup_group.columns:
+            df_updated = df_updated.merge(df_lookup_group[['Item Name', 'Category']], on='Item Name', how='left')
+            
     if 'Category' in df_updated.columns and 'Item Name' in df_updated.columns:
-        df_updated.loc[df_updated['Item Name'] == 'ReDenim Hustler Bag 15"', 'Category'] = 'Bags'
-        df_updated.loc[df_updated['Item Name'] == 'Redenim Founder’s Bag', 'Category'] = 'Bags'
-        df_updated.loc[df_updated['Item Name'] == 'Sarvam – Monitoring and Evaluation', 'Category'] = 'Others'
-        df_updated.loc[df_updated['Item Name'] == 'GUN ‐ COMMERCIAL', 'Category'] = 'Others'
-        df_updated.loc[df_updated['Item Name'] == 'Milestone One(Zoho Creator – MRF Dashboard)', 'Category'] = 'IT'
-        df_updated.loc[df_updated['Item Name'] == 'Milestone Two Implementation of Zoho Creator – PRF Dashboard', 'Category'] = 'IT'
+        df_updated.loc[df_updated['Item Name'].str.contains('Redenim', case=False, na=False) & (df_updated['Category'].isna() | (df_updated['Category'] == '')), 'Category'] = 'Bags'
+        df_updated.loc[df_updated['Item Name'].str.contains('Sarvam', case=False, na=False) & (df_updated['Category'].isna() | (df_updated['Category'] == '')), 'Category'] = 'Others'
+        df_updated.loc[df_updated['Item Name'].str.contains('Milestone', case=False, na=False) & (df_updated['Category'].isna() | (df_updated['Category'] == '')), 'Category'] = 'IT'
+        
+        # Step 29: Drop Missing Categories
         df_updated = df_updated.dropna(subset=['Category'])
         
+    # Step 30: Remove Duplicate Rows
     df_updated = df_updated.drop_duplicates()
     
-    # Step 7: Compliance Engineering & Vendor Master Cleanse
+    # Step 31 & 32 & 37: Lookup Table Standardization, Consolidation & City Imputation
     if os.path.exists(vendors_status_path) and 'Vendor Name' in df_updated.columns:
         lookupdb = pd.read_csv(vendors_status_path)
         lookupdb.loc[lookupdb['Vendor Status'] == 'Vendor Registered', 'Vendor Status'] = 'Vendor Registered.'
@@ -719,17 +726,30 @@ if os.path.exists("raw_purchase.csv"):
         
         lookupdb = pd.concat([lookupdb_clean, df_filtered])
         
+        # Merge with suffixes to handle identical column names
         df_updated = df_updated.merge(
             lookupdb[['Vendor Name', 'GST Identification Number (GSTIN)', 'Vendor Status', 'Type', 'City']],
             on='Vendor Name',
-            how='left'
+            how='left',
+            suffixes=('', '_lookup')
         )
         
+        # Consolidate overlapping fields
+        for c in ['GST Identification Number (GSTIN)', 'Vendor Status', 'Type', 'City']:
+            lookup_col = f"{c}_lookup"
+            if lookup_col in df_updated.columns:
+                df_updated[c] = df_updated[c].fillna(df_updated[lookup_col]).replace(r'^\\s*$', np.nan, regex=True).fillna(df_updated[lookup_col])
+                df_updated.drop(columns=[lookup_col], inplace=True, errors='ignore')
+        
+        # Step 33: Filter Out Rejected Invoices
         if 'Invoice Status' in df_updated.columns:
             df_updated = df_updated[df_updated['Invoice Status'] != 'Rejected Invoices']
+            
+        # Step 34: Filter Out Inactive Vendors
         if 'Vendor Status' in df_updated.columns:
             df_updated = df_updated[df_updated['Vendor Status'] != 'Vendor Inactive.']
             
+        # Step 35: Compliance Status Imputation
         df_updated['Compliance Status'] = np.where(df_updated['GST Identification Number (GSTIN)'].notnull(), 'Compliant', None)
         df_updated.loc[(df_updated['Compliance Status'].isnull()) & (df_updated['Vendor Status'].isin(['Vendor Registered.', 'Vendor Validated.'])), 'Compliance Status'] = 'Compliant'
         df_updated.loc[((df_updated['Type'] == 'Registered') & (df_updated['Compliance Status'].isnull())), 'Compliance Status'] = 'Compliant'
@@ -738,7 +758,7 @@ if os.path.exists("raw_purchase.csv"):
             df_updated.loc[df_updated['Expense Type'] == 'GST Purchases', 'Compliance Status'] = 'Compliant'
         df_updated.loc[df_updated['Compliance Status'].isnull(), 'Compliance Status'] = 'Non-compliant'
         
-    # Step 8: Casing Standardization & Geospatial Mapping
+    # Step 36: Vendor Name Standardization (Casing and drop BESCOM/PUMA)
     if 'Vendor Name' in df_updated.columns:
         df_updated['Vendor Name'] = df_updated['Vendor Name'].astype(str).str.upper()
         df_updated = df_updated[~df_updated['Vendor Name'].str.contains('BESCOM|PUMA', na=False, case=False)]
@@ -766,9 +786,11 @@ else:
     print("raw_purchase.csv not found!")
 `;
 
+
 export function ZohoModule() {
   const sync = useServerFn(syncZohoBooks);
   const pythonRun = useServerFn(runPythonCleaning);
+  const loadLookups = useServerFn(loadCleaningLookups);
   const [phase, setPhase] = useState<Phase>("idle");
   const [step, setStep] = useState(0);
   const [data, setData] = useState<SyncResult | null>(null);
@@ -901,7 +923,7 @@ export function ZohoModule() {
     reader.readAsText(file);
   };
 
-  const runTSPipeline = () => {
+  const runTSPipeline = async () => {
     setPipelineLogs([]);
     setPipelinePhase("running");
     
@@ -916,53 +938,62 @@ export function ZohoModule() {
       addLog("system", "Initializing in-browser Data Imputation Engine (TypeScript)...");
     }, 100);
 
-    setTimeout(() => {
-      if (!salesRawData && !purchaseRawData) {
-        addLog("error", "No raw Zoho files uploaded. Please drop Sales or Purchase spreadsheet files.");
+    setTimeout(async () => {
+      try {
+        addLog("system", "Synchronizing lookup database schemas from workspace server...");
+        const lookups = await loadLookups();
+        addLog("system", "Lookup databases successfully synchronized.");
+
+        if (!salesRawData && !purchaseRawData) {
+          addLog("error", "No raw Zoho files uploaded. Please drop Sales or Purchase spreadsheet files.");
+          setPipelinePhase("error");
+          return;
+        }
+        
+        let finalSales: any[] = [];
+        let finalPurchase: any[] = [];
+        let salesImputedCount = 0;
+        let purchaseImputedCount = 0;
+        
+        if (salesRawData) {
+          addLog("system", `Profiling raw Sales dataset: found ${salesRawData.length} records.`);
+          addLog("system", "Step 1: Normalizing column schemas & lowercasing identifiers...");
+          addLog("system", "Step 2: Checking date fields & applying local timestamp fallbacks...");
+          addLog("system", "Step 3: Executing balance imputation strategy (Paid -> 0, Missing -> Total)...");
+          const { cleaned, imputedCount } = cleanDataTS("sales", salesRawData, lookups);
+          finalSales = cleaned;
+          salesImputedCount = imputedCount;
+          addLog("system", `Sales clean completed. Imputed outstanding balances for ${imputedCount} invoices.`);
+        }
+        
+        if (purchaseRawData) {
+          addLog("system", `Profiling raw Purchase dataset: found ${purchaseRawData.length} records.`);
+          addLog("system", "Step 1: Standardizing bill number & supplier names headers...");
+          addLog("system", "Step 2: Aligning transactional dates...");
+          addLog("system", "Step 3: Applying vendor balance imputations...");
+          const { cleaned, imputedCount } = cleanDataTS("purchase", purchaseRawData, lookups);
+          finalPurchase = cleaned;
+          purchaseImputedCount = imputedCount;
+          addLog("system", `Purchase clean completed. Imputed outstanding balances for ${imputedCount} bills.`);
+        }
+        
+        setCleanedSales(finalSales);
+        setCleanedPurchase(finalPurchase);
+        setPipelineStats({
+          salesRawCount: salesRawData?.length ?? 0,
+          salesCleanedCount: finalSales.length,
+          salesImputedBalances: salesImputedCount,
+          purchaseRawCount: purchaseRawData?.length ?? 0,
+          purchaseCleanedCount: finalPurchase.length,
+          purchaseImputedBalances: purchaseImputedCount,
+        });
+        
+        addLog("system", "Pipeline compilation successful. Cleans completed with zero exceptions.");
+        setPipelinePhase("done");
+      } catch (err: any) {
+        addLog("error", `Engine initialization error: ${err.message || String(err)}`);
         setPipelinePhase("error");
-        return;
       }
-      
-      let finalSales: any[] = [];
-      let finalPurchase: any[] = [];
-      let salesImputedCount = 0;
-      let purchaseImputedCount = 0;
-      
-      if (salesRawData) {
-        addLog("system", `Profiling raw Sales dataset: found ${salesRawData.length} records.`);
-        addLog("system", "Step 1: Normalizing column schemas & lowercasing identifiers...");
-        addLog("system", "Step 2: Checking date fields & applying local timestamp fallbacks...");
-        addLog("system", "Step 3: Executing balance imputation strategy (Paid -> 0, Missing -> Total)...");
-        const { cleaned, imputedCount } = cleanDataTS("sales", salesRawData);
-        finalSales = cleaned;
-        salesImputedCount = imputedCount;
-        addLog("system", `Sales clean completed. Imputed outstanding balances for ${imputedCount} invoices.`);
-      }
-      
-      if (purchaseRawData) {
-        addLog("system", `Profiling raw Purchase dataset: found ${purchaseRawData.length} records.`);
-        addLog("system", "Step 1: Standardizing bill number & supplier names headers...");
-        addLog("system", "Step 2: Aligning transactional dates...");
-        addLog("system", "Step 3: Applying vendor balance imputations...");
-        const { cleaned, imputedCount } = cleanDataTS("purchase", purchaseRawData);
-        finalPurchase = cleaned;
-        purchaseImputedCount = imputedCount;
-        addLog("system", `Purchase clean completed. Imputed outstanding balances for ${imputedCount} bills.`);
-      }
-      
-      setCleanedSales(finalSales);
-      setCleanedPurchase(finalPurchase);
-      setPipelineStats({
-        salesRawCount: salesRawData?.length ?? 0,
-        salesCleanedCount: finalSales.length,
-        salesImputedBalances: salesImputedCount,
-        purchaseRawCount: purchaseRawData?.length ?? 0,
-        purchaseCleanedCount: finalPurchase.length,
-        purchaseImputedBalances: purchaseImputedCount,
-      });
-      
-      addLog("system", "Pipeline compilation successful. Cleans completed with zero exceptions.");
-      setPipelinePhase("done");
     }, 1000);
   };
 
